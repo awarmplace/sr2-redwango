@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+*.pkl
+*.state
+_stdout.txt
+_stderr.txt
