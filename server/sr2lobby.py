@@ -324,6 +324,9 @@ class Lobby:
         self.launched = set()
         self.pending_launch = []      # (when, client), staged joiners
         self.team_settings = {}       # team name -> (8 bytes, flags word)
+        self.stats = {}               # player name -> 30 byte stats block,
+                                      # for THIS session. The original service
+                                      # kept nothing durable and neither do we.
         self.last_rate = 0.0          # last per-client rate report
 
     def roster(self):
@@ -698,6 +701,12 @@ class Lobby:
                 m[0x88] = ord("*")
         if member.racing:
             m[0xa4:0xa8] = (1).to_bytes(4, "little")
+        # The player's stats block at 0x6a, exactly as that player last
+        # reported it in its periodic 1015. The server is a mirror here: it
+        # stores the 30 bytes and hands them back, inventing nothing.
+        block = self.stats.get(member.realname or b"?")
+        if block:
+            m[0x6a:0x6a + len(block[:0x1e])] = block[:0x1e]
         return c203.sign(bytes(m))
 
     def send_team_info(self, raw):
@@ -1237,9 +1246,31 @@ class Lobby:
             log(f"  <- {client.name}: C203_WHO, answering with the user list")
             self.send_full_list(client)
 
+        elif t == 1015:
+            # THE PERIODIC STATUS REPORT. The client sends its own 30 byte
+            # stats block every 30 seconds: its record as ASCII "%4d/%4d",
+            # then binary fields. The SAME block shape travels inside
+            # C203_WHO at 0x6a, so the block is stored per player and echoed
+            # back in every WHO record. The server invents no bytes; it is a
+            # mirror. Whether the client updates its own numbers after a
+            # race, or reports a result for the server to count, is not yet
+            # measured; the first finished race with this logging decides it.
+            block = bytes(msg[0x1a:0x1a + 0x1e])
+            old = self.stats.get(client.realname or b"?")
+            if old != block:
+                self.stats[client.realname or b"?"] = block
+                shown = block[:10].split(b"\0")[0].decode("latin1", "replace")
+                log(f"  <- {client.name}: 1015 stats update {shown!r} "
+                    f"{block[10:].hex(' ')}")
+                # The lobby draws from WHO records, so push the change.
+                self.push_user(client)
+
         else:
             # Log the payload, not just the type. The client's requests carry
-            # names and ids that say what they ask for.
+            # names and ids that say what they ask for. An UNKNOWN type after
+            # a finished race is the prime suspect for the result report
+            # (DWSendResult exists in the game and types 1016 to 1018 have no
+            # receive handler, so they can only be client to server).
             body = msg[0x1a:0x40]
             text = body.split(b"\0")[0].decode("latin1", "replace")
             log(f"  <- {client.name}: type {t} ({c203.name_of(t)}), "
@@ -1280,6 +1311,12 @@ class Lobby:
                 teams = {c.team for c in self.roster() if c.team}
                 for raw in teams:
                     if raw not in self.launching:
+                        continue
+                    if raw in self.launched:
+                        # The race is running. A re-arm here injects TeamInfo
+                        # and node rows into the race module's stream and
+                        # resets client state under it. The gate is only for
+                        # teams still forming.
                         continue
                     members = self.team_members(raw)
                     if len(members) >= 2 and not all(c.ready for c in members):
