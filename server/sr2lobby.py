@@ -158,7 +158,6 @@ MOTD = [
 # room read a count of 0 and the press did nothing. A filler room ahead of the
 # real one moves the index off zero.
 ROOMS = ["SEGA RALLY 2", "GAMEOVERYEAH", "CRAIGSTADLER", "KATANA"]
-TEAMS = ["TEAM A", "TEAM B"]
 
 # How to wake the client.
 #
@@ -169,6 +168,15 @@ TEAMS = ["TEAM A", "TEAM B"]
 # to stand in for the missing piece of modem emulation.
 WAKE_TEXT = bytes([13, 10]) + b"CONNECT 33600" + bytes([13, 10])
 
+# A joiner is launched as soon as the HOST emits its first race-layer
+# record, which proves its DirectPlay session exists. This is the fallback
+# if the host never speaks: launch anyway rather than hang for ever.
+LAUNCH_DEADLINE = float(os.environ.get("SR2_LAUNCH_DEADLINE", "3.0"))
+# Extra seconds the previous node must have been talking before the next
+# joiner is admitted. Zero: releasing on the first record is enough, and
+# raising this was measured to change nothing.
+LAUNCH_SETTLE = float(os.environ.get("SR2_LAUNCH_SETTLE", "0"))
+
 # UTF-8, not the platform default. Team and player names arrive in Shift-JIS,
 # and a decoded name raised UnicodeEncodeError inside the log call on a cp1252
 # console, which killed the server the moment a player created a team.
@@ -176,7 +184,7 @@ LOG = open("sr2lobby.log", "w", encoding="utf-8")
 
 
 def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    line = f"[{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d}] {msg}"
     try:
         print(line, flush=True)
     except UnicodeEncodeError:
@@ -233,15 +241,58 @@ class Client:
         self.leader = False        # created the team, so leads it
         self.ready = False         # every node it expects has reported
         self.racing = False        # the race module has this player
+        self.race_seen = False     # emitted a race record since launching
+        self.race_first = 0.0      # when it emitted that first record
         self.relayed = 0           # untyped frames relayed to peers
         self.hubbed = 0            # typed frames forwarded to peers
+        self.out = bytearray()     # bytes queued for this client, not yet sent
+        self.sent = 0              # bytes actually pushed, for the rate log
+        self.peak_out = 0          # deepest backlog seen
+        self.dead = False          # the socket failed; drop it on the next pass
+
+    # NOTHING HERE MAY BLOCK.
+    #
+    # Every send used to be a blocking sendall on a blocking socket, and the
+    # select() call only ever watched for READABLE sockets. One client that
+    # stopped reading therefore froze the whole server: no other client was
+    # read, served or relayed to until that one drained.
+    #
+    # A client DOES stop reading. The emulator's bridge drains its socket only
+    # when SerialBridgeService::poll() runs, and that runs only when the
+    # emulated modem polls it. During the race module handoff the guest tears
+    # the modem down and builds it again, and nothing drains in that window.
+    #
+    # The cost grows as N(N-1): every record from one player is written to every
+    # other player. Six writes with three players, twelve with four. That is why
+    # three players raced and four fell apart at launch.
+    #
+    # So bytes are QUEUED here and pushed by flush() when the socket says it can
+    # take them. The server never waits for a guest.
+    def queue(self, data):
+        if not self.dead:
+            self.out += data
+            if len(self.out) > self.peak_out:
+                self.peak_out = len(self.out)
 
     def send(self, msg, label):
-        try:
-            self.conn.sendall(c203.frame(msg))
-            log(f"  -> {self.name}: {label}")
-        except OSError as e:
-            log(f"  -> {self.name}: send failed, {e}")
+        self.queue(c203.frame(msg))
+        log(f"  -> {self.name}: {label}")
+
+    def flush(self):
+        """Push what the socket will take. Never waits."""
+        while self.out and not self.dead:
+            try:
+                n = self.conn.send(self.out)
+            except BlockingIOError:
+                return                      # full for now; try again next pass
+            except OSError as e:
+                log(f"  -> {self.name}: send failed, {e}")
+                self.dead = True
+                return
+            if n <= 0:
+                return
+            self.sent += n
+            del self.out[:n]
 
     def pump_wakeup(self):
         """Send the modem CONNECT text until the client answers."""
@@ -251,10 +302,7 @@ class Client:
         if now - self.last_wake >= 3.0:
             self.last_wake = now
             self.wakes += 1
-            try:
-                self.conn.sendall(WAKE_TEXT)
-            except OSError:
-                pass
+            self.queue(WAKE_TEXT)
             if self.wakes <= 2 or self.wakes % 5 == 0:
                 log(f"  -> {self.name}: modem CONNECT #{self.wakes}")
 
@@ -274,6 +322,9 @@ class Lobby:
         # frames only for a team that is in `launching`, so removing a team
         # there to stop a second launch would silence the race itself.
         self.launched = set()
+        self.pending_launch = []      # (when, client), staged joiners
+        self.team_settings = {}       # team name -> (8 bytes, flags word)
+        self.last_rate = 0.0          # last per-client rate report
 
     def roster(self):
         return [c for c in self.clients.values() if c.in_lobby]
@@ -284,7 +335,7 @@ class Lobby:
     def unique_name(self, wanted, me):
         """Return a name nobody else in the lobby is using.
 
-        MEASURED 2026-08-14: two players who logged in with the same name broke
+        MEASURED: two players who logged in with the same name broke
         the lobby for BOTH. C203_WHO looks a name up before it adds it, so the
         second player folded into the first entry. One client showed a room
         count of 1 and one user; the other showed 0 and an EMPTY user list, and
@@ -381,7 +432,7 @@ class Lobby:
     def leave_race(self, client):
         """The player came back from the race. Put them back in the lobby clean.
 
-        MEASURED 2026-08-14, three clients that finished a race and exited:
+        MEASURED, three clients that finished a race and exited:
         each one sent 542 ReConnect, then 540, and then re-sent 535 to join the
         team it was ALREADY in. The server still held the old membership, the
         old leader flag and the old ready flag, so the re-join stacked on top of
@@ -402,6 +453,7 @@ class Lobby:
         log(f"  {client.name} returned from the race, clearing team state")
 
         client.racing = False
+        client.race_seen = False
         client.team = b""
         client.leader = False
         client.ready = False
@@ -428,7 +480,7 @@ class Lobby:
     def depart(self, client, why):
         """Take a client out of the shared state, cleanly.
 
-        MEASURED 2026-08-14: when a player closed the window, the user list
+        MEASURED: when a player closed the window, the user list
         updated but the player stayed in their team. If that player was the
         LEADER, the team was left with no leader, so it could never start a
         race and the remaining member had no way out except reconnecting. The
@@ -528,15 +580,6 @@ class Lobby:
             rooms.setdefault(c.room, []).append(c.name)
         log(f"rooms are now {rooms}")
 
-    # EXPERIMENT. The room-select dialog shows an occupancy number beside each
-    # room. MEASURED: a client shows its OWN room's count correctly (it counts
-    # its user list) but every other room reads 0, which is what we leave in the
-    # C203_ListElement message. So the count for a room you are NOT in comes
-    # from that message, in a field we have never filled.
-    #
-    # To find the field without guessing: write a DIFFERENT recognisable number
-    # at each candidate offset. Whichever number appears on screen names the
-    # offset. Set SR2_PROBE=1 to turn this on.
     def room_element(self, room, count):
         """One C203_ListElement: the room name at 0x1a, its occupancy at 0x48.
 
@@ -662,7 +705,9 @@ class Lobby:
 
         C203_TeamInfo, type 537. The handler stores:
             0x1a  team id
-            0x1c  member count, which becomes the node count at state+0xe0
+            0x1c  the node table row count, ALWAYS 1: see the note at the
+                  count write below. It also becomes the node count at
+                  state+0xe0, the gate that expects that many NodeAddress rows
             0x1e  the RECIPIENT'S OWN node index
             0x20  four 16-bit settings
             0x28  a flags word
@@ -699,14 +744,29 @@ class Lobby:
         except UnicodeDecodeError:
             shown = raw.decode("latin1", "replace")
 
+        ranked = sorted(members, key=lambda c: not c.leader)  # leader first
         m = bytearray(0xB0)
         m[c203.OFF_TYPE:c203.OFF_TYPE + 2] = TYPE_TEAMINFO.to_bytes(2, "little")
         m[0x1a:0x1c] = team_id.to_bytes(2, "little")
-        m[0x1c:0x1e] = len(members).to_bytes(2, "little")   # the real count
-        m[0x28:0x2c] = (0x00080000).to_bytes(4, "little")   # PAD mode bit
+        # The count is ALWAYS 1, never the member count. This field sizes the
+        # transport's node table, and the transport init (DPDW30DC
+        # FUN_10001e80) fills only row 0, with the console's own pad. Rows it
+        # pre-claims beyond that stay empty, so peer lookups miss and every
+        # peer is APPENDED past the count into a table of five slots. With the
+        # member count here, two players fitted, three sat exactly at the cap,
+        # and four could never fit: 4 claimed + 3 appends is 7. With 1 the
+        # table holds what it was designed for: self, three appended peers,
+        # and the broadcast slot.
+        m[0x1c:0x1e] = (1).to_bytes(2, "little")
+        settings, flags = self.team_settings.get(raw, (b"", 0))
+        if settings:
+            m[0x20:0x20 + len(settings[:8])] = settings[:8]
+        # The PAD mode bit must survive. The handler ORs its own bit in too, so
+        # keeping the creator's flags alongside it is the same shape.
+        m[0x28:0x2c] = (0x00080000 | flags).to_bytes(4, "little")
         m[0x2c:0x2c + len(raw[:0x13])] = raw[:0x13]
         for c in members:
-            m[0x1e:0x20] = (0).to_bytes(2, "little")        # every console is node 0
+            m[0x1e:0x20] = (0).to_bytes(2, "little")    # every console is node 0
             c.send(c203.sign(bytes(m)),
                    f"C203_TeamInfo {shown!r} members={len(members)} node=0")
 
@@ -715,15 +775,18 @@ class Lobby:
         for c in members:
             c.send(make(TYPE_GAMELISTDONE), "C203_GameListDone")
 
-        # Name every node, once per console. Leader takes PAD 1, then 2, 3.
-        ranked = sorted(members, key=lambda c: not c.leader)  # leader first
+        # Name the nodes, one table per console: itself first, then the peers.
+        # The transport reads only row 0 of this, its own pad and name; it
+        # learns the peers dynamically from their traffic. The extra rows feed
+        # the DWANGO layer and are harmless to the transport. PADs are global
+        # and unique: leader 1, then join order.
         pad_of = {c: i + 1 for i, c in enumerate(ranked)}
         for target in members:
             ordered = [target] + [c for c in ranked if c is not target]
             for node_idx, c in enumerate(ordered):
                 n = bytearray(0xE0)
                 n[c203.OFF_TYPE:c203.OFF_TYPE + 2] = TYPE_NODEADDRESS.to_bytes(2, "little")
-                n[0x1a:0x1c] = node_idx.to_bytes(2, "little")     # index, target=0
+                n[0x1a:0x1c] = node_idx.to_bytes(2, "little")     # index, self=0
                 n[0x1c:0x1e] = pad_of[c].to_bytes(2, "little")    # GLOBAL PAD
                 who = (c.realname or c.name.encode("latin1"))[:0xF]
                 n[0x1e:0x1e + len(who)] = who
@@ -738,22 +801,9 @@ class Lobby:
         0x1a, 0x2e, 0x42, 0x56 and 0x6a. Its handler runs only when the node
         table is complete. The strings feed the DirectPlay session setup.
         """
-        # REMOVED 2026-08-14, and this is the ONE variable in this run.
-        #
-        # A second C203_NodeAddress used to go out here, just before the launch:
-        # node index 0, pad 1, address "NODE0". The old comment admitted it
-        # repeated what send_team_info had already sent and that its effect had
-        # never been established. It was copied from the first two-player race.
-        #
-        # It is wrong now. send_team_info builds a PER-CONSOLE table in which
-        # node 0 is that console ITSELF, with that console's own pad. This
-        # message overwrote node 0 on every client with a fake name and pad 1.
-        # With two players that was survivable. With four, three of the four
-        # consoles got a wrong entry for themselves, and one client failed to
-        # reach the race while the other three raced.
-        #
-        # To put it back, restore the six lines that built a 0xE0 message with
-        # TYPE_NODEADDRESS, 0 at 0x1a, 1 at 0x1c and b"NODE0" at 0x1e.
+        # Do NOT send another C203_NodeAddress here. An early version did, with
+        # node 0, pad 1 and a fake name, which overwrote each console's OWN
+        # entry in its node table. Two players survived that by luck.
 
         # 0x56 carries the PLAYER name. It used to send client.name, which was
         # our own log label, so the launch announced a player called RALLY2 who
@@ -786,8 +836,14 @@ class Lobby:
             # client's modem stream and broke dialling.
             if not (client.team and client.team in self.launching):
                 return
+            # Relay ONLY to members whose race module is up. The transport
+            # re-sends unacknowledged records on a retry thread, and a member
+            # still in the lobby cannot acknowledge anything, so relaying to
+            # it turns the retries into a flood that hits the member the
+            # moment it launches. The transport's node table appends without
+            # a duplicate check, so that flood can fill it.
             peers = [c for c in self.team_members(client.team)
-                     if c is not client]
+                     if c is not client and c.racing]
             if not peers:
                 return
             client.relayed += 1
@@ -796,7 +852,7 @@ class Lobby:
                     f"{len(msg)} bytes -> {[c.name for c in peers]}")
             for c in peers:
                 try:
-                    c.conn.sendall(c203.frame(msg))
+                    c.queue(c203.frame(msg))
                 except OSError:
                     pass
             return
@@ -811,7 +867,7 @@ class Lobby:
             for c in self.team_members(client.team):
                 if c is not client:
                     try:
-                        c.conn.sendall(c203.frame(msg))
+                        c.queue(c203.frame(msg))
                     except OSError:
                         pass
             client.hubbed += 1
@@ -874,7 +930,17 @@ class Lobby:
                 self.teams.append((team_id, raw))
             client.team = raw
             client.leader = True       # the creator leads the team
-            log(f"  <- {client.name}: CREATE TEAM {shown!r}, id {team_id}")
+            # THE CREATOR'S SETTINGS. 530 carries four 16-bit values at 0x42 and
+            # a flags word at 0x4a. C203_TeamInfo has a matching block of four
+            # 16-bit values at 0x20 and a flags word at 0x28, and its handler
+            # copies all of them into the team struct. We used to send zeros
+            # there, so whatever the creator chose never reached the other
+            # players. Keep them and pass them on.
+            settings = bytes(msg[0x42:0x4a])
+            flags = int.from_bytes(msg[0x4a:0x4e], "little") if len(msg) >= 0x4e else 0
+            self.team_settings[raw] = (settings, flags)
+            log(f"  <- {client.name}: CREATE TEAM {shown!r}, id {team_id}, "
+                f"settings={settings.hex(' ')} flags={flags:#010x}")
 
             # NO C203_TeamInfo here. Its handler sets the gate byte at
             # state+0xe8 to 1, node completion sets state+0xe9, and the start
@@ -920,7 +986,7 @@ class Lobby:
 
         elif t == TYPE_LEAVE:
             # The client says goodbye before it drops the line. MEASURED
-            # 2026-08-14: a player who closed the window sent this 26-byte
+            # MEASURED: a player who closed the window sent this 26-byte
             # message with no payload, and the socket closed a moment later.
             # Handling it here means the lobby reacts at once instead of
             # waiting for the socket to die.
@@ -1079,7 +1145,7 @@ class Lobby:
             client.room = room
             client.send(make(TYPE_LOBBYINFO, {0x1a: room}), f"C203_LOBBYINFO {room}")
             client.send(make(TYPE_SYNC, {0x1a: room}), "C203_Sync (room entered)")
-            # MEASURED 2026-08-14: the client does NOT filter its user list by
+            # MEASURED: the client does NOT filter its user list by
             # the room field at 0x2e. Two players in different rooms were each
             # sent both records, and BOTH clients listed both players and
             # counted 2 in their own room. So a client must only ever be told
@@ -1107,25 +1173,53 @@ class Lobby:
                 if members and all(c.ready for c in members):
                     if client.team in self.launching and client.team not in self.launched:
                         log(f"  every member of {client.team!r} is ready. Launching.")
-                        # Take the team OUT of the launching set FIRST, and
-                        # clear every ready flag, so this runs exactly once.
-                        #
-                        # MEASURED 2026-08-14 with four players: without this,
-                        # the launch block went out FIVE times. client.ready was
-                        # never reset after a race, so the "all ready" test
-                        # passed on the very first 573 of the next race and
-                        # passed again on each one after it. Every repeat sent
-                        # another C203_LaunchModule to all four clients, which
-                        # restarts the race module under them. One emulator was
-                        # thrown back to NAME ENTRY, one sat at PLEASE WAIT and
-                        # one reached SELECT COURSE. It looked like a timing or
-                        # threading fault. It was neither: all five rounds
-                        # happened inside one second, in one select loop.
+                        # Mark the team launched and clear every ready flag
+                        # FIRST, so this block runs exactly once per race.
+                        # Without the reset, stale ready flags let the next
+                        # 573 fire the whole launch again, and a repeated
+                        # C203_LaunchModule restarts the race module under a
+                        # client that is already running it.
                         self.launched.add(client.team)
                         for c in members:
                             c.ready = False
-                        for c in members:
-                            self.launch_after_team(c)
+                        # THE HOST GOES FIRST, AND ALONE.
+                        #
+                        # DirectPlay is host and joiner, not a mesh. A joiner
+                        # enumerates sessions from the host, so the host must
+                        # have created its session before any joiner asks. The
+                        # leader hosts: the '*' at C203_WHO offset 0x88 decides
+                        # both the start command and the DirectPlay host.
+                        #
+                        # Every member used to be launched in one pass, in
+                        # roster order, so joiners could enumerate before the
+                        # host existed. That fits what we see: two players are
+                        # forgiving, three work SOMETIMES, and four leave two
+                        # clients back in the lobby. A fixed capacity would fail
+                        # the same way every time; this does not.
+                        host = next((c for c in members if c.leader), members[0])
+                        self.launch_after_team(host)
+                        host.race_seen = False
+                        rest = [c for c in members if c is not host]
+                        # ONE JOINER AT A TIME, IN A CHAIN.
+                        #
+                        # Releasing every joiner the moment the host spoke only
+                        # moved the collision: three joiners were released in
+                        # the same instant and then raced each other to join.
+                        # MEASURED: all three were released at 21:30:30 and two
+                        # of them fell back to the lobby.
+                        #
+                        # So each joiner waits for the PREVIOUS one to emit a
+                        # race record, not for the host. The host admits one
+                        # connection at a time, which is what it is built for.
+                        waiton = host
+                        for i, c in enumerate(rest):
+                            c.race_seen = False
+                            self.pending_launch.append(
+                                (time.time() + LAUNCH_DEADLINE * (i + 1), c, waiton))
+                            waiton = c
+                        if rest:
+                            log(f"  host {host.name} launched. "
+                                f"{len(rest)} joiner(s) admitted one at a time")
                     else:
                         # A team that is ready but has not asked to start is
                         # waiting for its leader. The server must not start a
@@ -1156,13 +1250,22 @@ class Lobby:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", PORT))
-        srv.listen(4)
+        srv.listen(16)      # the backlog was 4, which matched the old 4-name cap
         log(f"lobby listening on port {PORT}. Start each emulator with "
             f"MODEMBRIDGE=127.0.0.1:{PORT}")
 
         while True:
             socks = [srv] + [c.conn for c in self.clients.values()]
-            readable, _, _ = select.select(socks, [], [], 0.1)
+            # Watch for WRITABLE too. A client with queued bytes is only pushed
+            # when its socket says it can take them, so a guest that has stopped
+            # draining costs us nothing and blocks nobody else.
+            waiting = [c.conn for c in self.clients.values() if c.out]
+            readable, writable, _ = select.select(socks, waiting, [], 0.1)
+
+            for s in writable:
+                c = self.clients.get(s)
+                if c is not None:
+                    c.flush()
 
             now = time.time()
             # Re-arm any team member that has not reported ready. A client that
@@ -1184,12 +1287,48 @@ class Lobby:
                         log(f"  re-arming {raw!r}, still waiting on {stale}")
                         self.send_team_info(raw)
 
+            # Staged joiner launches. See the host-goes-first note in the
+            # 573 handler: a joiner must not enumerate before the host exists.
+            if self.pending_launch:
+                # A joiner is released when the one before it has been up for
+                # LAUNCH_SETTLE seconds, not the instant it first speaks. The
+                # first record only proves it started talking; the join itself
+                # takes about four seconds in a clean three-player run.
+                ready = [p for p in self.pending_launch
+                         if (p[2].race_seen
+                             and now - p[2].race_first >= LAUNCH_SETTLE)
+                         or p[0] <= now]
+                self.pending_launch = [p for p in self.pending_launch
+                                       if p not in ready]
+                for deadline, c, host in ready:
+                    if c.conn not in self.clients:
+                        continue
+                    why = (f"{host.name} settled" if host.race_seen
+                           else "deadline")
+                    log(f"  releasing joiner {c.name} ({why})")
+                    self.launch_after_team(c)
+
+            # THE LINE RATE CHECK. An emulated 33.6k modem carries about 4200
+            # bytes a second. If a client is sent more than that it can never
+            # drain, its backlog grows without limit, and every message reaches
+            # it later than the last. Print the rate and the backlog so the
+            # question is answered by measurement.
+            if now - self.last_rate >= 1.0:
+                self.last_rate = now
+                stuck = [f"{c.name}:q={len(c.out)}"
+                         for c in self.clients.values() if len(c.out) > 2048]
+                if stuck:
+                    log("  BACKLOG " + "  ".join(stuck))
+                for c in self.clients.values():
+                    c.sent = 0
+
             for c in list(self.clients.values()):
                 c.pump_wakeup()
 
             for s in readable:
                 if s is srv:
                     conn, addr = srv.accept()
+                    conn.setblocking(False)     # nothing may block the loop
                     self.next_name += 1
                     name = CONN_LABEL.format(self.next_name)
                     self.clients[conn] = Client(conn, addr, name)
@@ -1202,6 +1341,10 @@ class Lobby:
                     continue
                 try:
                     data = s.recv(4096)
+                except BlockingIOError:
+                    # A spurious readable. BlockingIOError is an OSError, so
+                    # without this arm the socket would look like a disconnect.
+                    continue
                 except OSError:
                     data = b""
                 if not data:
@@ -1234,26 +1377,41 @@ class Lobby:
                     records, client.deframer.race = client.deframer.race, []
                     peers = []
                     if client.team:
+                        # Only to members whose race module is up. See the
+                        # matching filter in handle(): race records relayed to
+                        # a parked member overflow the provider's node table
+                        # when it launches, and the session dies of it.
                         peers = [c for c in self.team_members(client.team)
-                                 if c is not client]
+                                 if c is not client and c.racing]
                     for end, rec in records:
-                        # Byte 0 is the SENDER's node id, the same value we
-                        # handed out as its pad in C203_NodeAddress. MEASURED
-                        # 2026-08-14 across a four-player attempt: the ids seen
-                        # were 1, 2, 3 and 4 and nothing else.
-                        #
-                        # It is NOT the documented DPDW30DC node byte
-                        # 0xc0 | dst<<3 | src. That form does not appear in this
-                        # traffic at all, so a record does not say who it is
-                        # FOR. This relay therefore broadcasts, and the receiver
-                        # decides what to keep.
+                        # Consume the transport's control records instead of
+                        # relaying them. They start 55 de ad cc and carry a
+                        # code word: 0x6c at module start, 0x6d at teardown.
+                        # They are link control, not peer traffic. Every
+                        # relayed copy fires a node-table append on every
+                        # receiver, and peers learn each other through the
+                        # DirectPlay join anyway. MEASURED: races form and
+                        # run with these consumed.
+                        if len(rec) >= 4 and rec[:4] == b"\x55\xde\xad\xcc":
+                            code = rec[4] if len(rec) > 4 else -1
+                            log(f"  CONTROL 70{end:02x} from {client.name} "
+                                f"code={code:#x} len={len(rec)} CONSUMED")
+                            continue
+                        # Byte 0 is the SENDER's pad. The real addressing
+                        # lives in the record TAIL: crc16, then a logical
+                        # source and destination byte, 0xff for broadcast.
+                        # This relay broadcasts and each receiver keeps what
+                        # is addressed to it.
+                        if not client.race_seen:
+                            client.race_seen = True
+                            client.race_first = time.time()
                         node = rec[0] if rec else 0
-                        log(f"  RACE RECORD 70 {end:02x} from {client.name} "
-                            f"node {node}, {len(rec)} bytes "
-                            f"-> {[c.name for c in peers]}")
+                        log(f"  RACE 70{end:02x} from {client.name} node={node} "
+                            f"len={len(rec)} head={rec[:8].hex()} tail={rec[-4:].hex()} "
+                            f"-> {','.join(c.name for c in peers)}")
                         for c in peers:
                             try:
-                                c.conn.sendall(c203.frame_race(rec, end))
+                                c.queue(c203.frame_race(rec, end))
                             except OSError:
                                 pass
 
