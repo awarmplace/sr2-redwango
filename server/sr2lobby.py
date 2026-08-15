@@ -53,11 +53,6 @@ import c203
 
 PORT = int(os.environ.get("SR2_PORT", "7654"))
 
-# The most connections the lobby will hold. A real session is a handful
-# of players; this only stops a peer from opening sockets until the file
-# descriptors run out.
-MAX_CLIENTS = int(os.environ.get("SR2_MAX_CLIENTS", "32"))
-
 LOBBY_NAME = "SEGA RALLY 2"
 # A label for the LOG ONLY, one per connection, counted upward without a limit.
 #
@@ -337,8 +332,17 @@ class Lobby:
     def roster(self):
         return [c for c in self.clients.values() if c.in_lobby]
 
-    def team_members(self, raw):
-        return [c for c in self.roster() if c.team == raw]
+    def team_members(self, raw, room):
+        """Members of a team, IN ONE ROOM.
+
+        A team is identified by (room, name), not by name alone. The client
+        does the same: its C203_WHO handler resolves the room at 0x2e to a
+        room id, then resolves the team name at 0x56 WITHIN that room. Keying
+        on the name alone merged two groups who happened to pick the same
+        team name in different rooms, and the launch then declared more
+        members than any one race had.
+        """
+        return [c for c in self.roster() if c.team == raw and c.room == room]
 
     def unique_name(self, wanted, me):
         """Return a name nobody else in the lobby is using.
@@ -467,11 +471,12 @@ class Lobby:
         client.ready = False
 
         if team:
-            members = self.team_members(team)
+            members = self.team_members(team, client.room)
             if not members:
-                self.teams = [t for t in self.teams if t[1] != team]
-                self.launching.discard(team)
-                self.launched.discard(team)
+                self.teams = [t for t in self.teams
+                              if not (t[1] == client.room and t[2] == team)]
+                self.launching.discard((client.room, team))
+                self.launched.discard((client.room, team))
                 log(f"  team {team!r} is empty now, forgetting it")
             elif not any(m.leader for m in members):
                 # Same rule as depart(): a team with no leader cannot start a
@@ -512,12 +517,13 @@ class Lobby:
         client.ready = False
 
         if team:
-            members = self.team_members(team)
+            members = self.team_members(team, room)
             if not members:
                 # nobody is left in it, so the team stops existing
-                self.teams = [t for t in self.teams if t[1] != team]
-                self.launching.discard(team)
-                self.launched.discard(team)
+                self.teams = [t for t in self.teams
+                              if not (t[1] == room and t[2] == team)]
+                self.launching.discard((room, team))
+                self.launched.discard((room, team))
                 log(f"  team {team!r} is empty now, forgetting it")
             elif not any(m.leader for m in members):
                 # the leader left. Promote someone, or the team is stuck: the
@@ -655,7 +661,9 @@ class Lobby:
         menu stays empty and reads "there are no teams you can join".
         """
         client.send(make(TYPE_LISTSTART), "C203_ListStart")
-        for team_id, raw_name in self.teams:
+        for team_id, team_room, raw_name in self.teams:
+            if team_room != client.room:
+                continue        # only the teams in this room
             try:
                 shown = raw_name.decode("shift_jis")
             except UnicodeDecodeError:
@@ -714,7 +722,7 @@ class Lobby:
             m[0x6a:0x6a + len(block[:0x1e])] = block[:0x1e]
         return c203.sign(bytes(m))
 
-    def send_team_info(self, raw):
+    def send_team_info(self, raw, room):
         """The launch handshake: C203_TeamInfo, then the node table.
 
         C203_TeamInfo, type 537. The handler stores:
@@ -749,10 +757,11 @@ class Lobby:
         consoles are told apart by the PAD. So each target gets itself as node
         0, carrying its own PAD, then the peers as nodes 1..N-1.
         """
-        members = self.team_members(raw)
+        members = self.team_members(raw, room)
         if not members:
             return
-        team_id = next((t[0] for t in self.teams if t[1] == raw), 1)
+        team_id = next((t[0] for t in self.teams
+                        if t[1] == room and t[2] == raw), 1)
         try:
             shown = raw.decode("shift_jis")
         except UnicodeDecodeError:
@@ -772,7 +781,7 @@ class Lobby:
         # table holds what it was designed for: self, three appended peers,
         # and the broadcast slot.
         m[0x1c:0x1e] = (1).to_bytes(2, "little")
-        settings, flags = self.team_settings.get(raw, (b"", 0))
+        settings, flags = self.team_settings.get((room, raw), (b"", 0))
         if settings:
             m[0x20:0x20 + len(settings[:8])] = settings[:8]
         # The PAD mode bit must survive. The handler ORs its own bit in too, so
@@ -848,7 +857,7 @@ class Lobby:
             # Relay ONLY inside a team whose launch has fired. Relaying
             # room-wide forwarded dial-time handshake fragments into the other
             # client's modem stream and broke dialling.
-            if not (client.team and client.team in self.launching):
+            if not (client.team and (client.room, client.team) in self.launching):
                 return
             # Relay ONLY to members whose race module is up. The transport
             # re-sends unacknowledged records on a retry thread, and a member
@@ -856,7 +865,7 @@ class Lobby:
             # it turns the retries into a flood that hits the member the
             # moment it launches. The transport's node table appends without
             # a duplicate check, so that flood can fill it.
-            peers = [c for c in self.team_members(client.team)
+            peers = [c for c in self.team_members(client.team, client.room)
                      if c is not client and c.racing]
             if not peers:
                 return
@@ -877,8 +886,8 @@ class Lobby:
         # session-creation time. Forward those to the other members as well as
         # handling them, so the session announcement reaches the peer. 1015 is
         # the periodic status the client sends the SERVER, so it is excluded.
-        if client.team and client.team in self.launching and t != 1015:
-            for c in self.team_members(client.team):
+        if client.team and (client.room, client.team) in self.launching and t != 1015:
+            for c in self.team_members(client.team, client.room):
                 if c is not client:
                     try:
                         c.queue(c203.frame(msg))
@@ -936,12 +945,13 @@ class Lobby:
             # Reuse a team of the same name. The client repeats its request
             # while it waits, and a fresh id per repeat would change its team
             # id underneath it.
-            existing = [t for t in self.teams if t[1] == raw]
+            existing = [t for t in self.teams
+                        if t[1] == client.room and t[2] == raw]
             if existing:
                 team_id = existing[0][0]
             else:
                 team_id = len(self.teams) + 1
-                self.teams.append((team_id, raw))
+                self.teams.append((team_id, client.room, raw))
             client.team = raw
             client.leader = True       # the creator leads the team
             # THE CREATOR'S SETTINGS. 530 carries four 16-bit values at 0x42 and
@@ -952,7 +962,7 @@ class Lobby:
             # players. Keep them and pass them on.
             settings = bytes(msg[0x42:0x4a])
             flags = int.from_bytes(msg[0x4a:0x4e], "little") if len(msg) >= 0x4e else 0
-            self.team_settings[raw] = (settings, flags)
+            self.team_settings[(client.room, raw)] = (settings, flags)
             log(f"  <- {client.name}: CREATE TEAM {shown!r}, id {team_id}, "
                 f"settings={settings.hex(' ')} flags={flags:#010x}")
 
@@ -1076,7 +1086,7 @@ class Lobby:
             # returns DP_OK and the other times out with 0x887700dc.
             peers = []
             if client.team:
-                peers = [c for c in self.team_members(client.team) if c is not client]
+                peers = [c for c in self.team_members(client.team, client.room) if c is not client]
             if not peers:
                 peers = [c for c in self.roster() if c is not client]
             log(f"  <- {client.name}: game channel type {t}, {len(msg)} bytes, "
@@ -1120,8 +1130,8 @@ class Lobby:
             # all-ready path sends LaunchModule.
             log(f"  <- {client.name}: 536 GAME START REQUEST team={client.team!r}")
             if client.team:
-                self.launching.add(client.team)
-                self.send_team_info(client.team)
+                self.launching.add((client.room, client.team))
+                self.send_team_info(client.team, client.room)
 
         elif t == TYPE_JOINTEAM:
             # Join an existing team, 48 bytes, the team name at 0x1a. The
@@ -1134,12 +1144,13 @@ class Lobby:
                 shown = raw.decode("shift_jis")
             except UnicodeDecodeError:
                 shown = raw.decode("latin1", "replace")
-            known = [t for t in self.teams if t[1] == raw]
+            known = [t for t in self.teams
+                     if t[1] == client.room and t[2] == raw]
             log(f"  <- {client.name}: 535, join team {shown!r}"
                 f"{'' if known else ' (unknown team)'}")
             if not known:
                 team_id = len(self.teams) + 1
-                self.teams.append((team_id, raw))
+                self.teams.append((team_id, client.room, raw))
             client.team = raw
             client.leader = False
             for other in self.roster():
@@ -1183,9 +1194,10 @@ class Lobby:
             client.ready = True
             log(f"  <- {client.name}: ready to race")
             if client.team:
-                members = self.team_members(client.team)
+                members = self.team_members(client.team, client.room)
                 if members and all(c.ready for c in members):
-                    if client.team in self.launching and client.team not in self.launched:
+                    if ((client.room, client.team) in self.launching
+                            and (client.room, client.team) not in self.launched):
                         log(f"  every member of {client.team!r} is ready. Launching.")
                         # Mark the team launched and clear every ready flag
                         # FIRST, so this block runs exactly once per race.
@@ -1193,7 +1205,7 @@ class Lobby:
                         # 573 fire the whole launch again, and a repeated
                         # C203_LaunchModule restarts the race module under a
                         # client that is already running it.
-                        self.launched.add(client.team)
+                        self.launched.add((client.room, client.team))
                         for c in members:
                             c.ready = False
                         # THE HOST GOES FIRST, AND ALONE.
@@ -1313,21 +1325,21 @@ class Lobby:
             # shut.
             if now - self.last_rearm >= 4.0:
                 self.last_rearm = now
-                teams = {c.team for c in self.roster() if c.team}
-                for raw in teams:
-                    if raw not in self.launching:
+                teams = {(c.room, c.team) for c in self.roster() if c.team}
+                for room, raw in teams:
+                    if (room, raw) not in self.launching:
                         continue
-                    if raw in self.launched:
+                    if (room, raw) in self.launched:
                         # The race is running. A re-arm here injects TeamInfo
                         # and node rows into the race module's stream and
                         # resets client state under it. The gate is only for
                         # teams still forming.
                         continue
-                    members = self.team_members(raw)
+                    members = self.team_members(raw, room)
                     if len(members) >= 2 and not all(c.ready for c in members):
                         stale = [c.name for c in members if not c.ready]
                         log(f"  re-arming {raw!r}, still waiting on {stale}")
-                        self.send_team_info(raw)
+                        self.send_team_info(raw, room)
 
             # Staged joiner launches. See the host-goes-first note in the
             # 573 handler: a joiner must not enumerate before the host exists.
@@ -1370,14 +1382,6 @@ class Lobby:
             for s in readable:
                 if s is srv:
                     conn, addr = srv.accept()
-                    # Refuse past the cap. Without it, one peer opening sockets
-                    # in a loop exhausts the file descriptors and the lobby
-                    # stops answering. The cap is far above any real lobby.
-                    if len(self.clients) >= MAX_CLIENTS:
-                        log(f"refused {addr[0]}:{addr[1]}, "
-                            f"{len(self.clients)} clients is the limit")
-                        conn.close()
-                        continue
                     conn.setblocking(False)     # nothing may block the loop
                     self.next_name += 1
                     name = CONN_LABEL.format(self.next_name)
@@ -1405,18 +1409,7 @@ class Lobby:
                     s.close()
                     continue
 
-                try:
-                    framed = client.deframer.feed(data)
-                except c203.DeframeError:
-                    # The peer sent a flood with no frame terminator. That is
-                    # not the game: drop it rather than grow a buffer for ever.
-                    log(f"{client.name} sent an unterminated flood, dropping it")
-                    self.depart(client, "flooded")
-                    del self.clients[s]
-                    s.close()
-                    continue
-
-                for msg in framed:
+                for msg in client.deframer.feed(data):
                     # One malformed message must not take the server down. A
                     # crash here closes the socket, and the client then waits
                     # for a reply that can never arrive.
@@ -1442,7 +1435,7 @@ class Lobby:
                         # matching filter in handle(): race records relayed to
                         # a parked member overflow the provider's node table
                         # when it launches, and the session dies of it.
-                        peers = [c for c in self.team_members(client.team)
+                        peers = [c for c in self.team_members(client.team, client.room)
                                  if c is not client and c.racing]
                     for end, rec in records:
                         # Consume the transport's control records instead of
