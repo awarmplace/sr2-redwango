@@ -8,24 +8,30 @@ Given extensive and remarkably successful work by the community to bring back lo
 
 The primary reason for this is the fact the game uses a unique-for-Dreamcast protocol based upon the legendary 90s PC multiplayer network - DWANGO. It operates the Dreamcast networking hardware in a mode unlike any other revived (and possibly dead, to be confirmed) game.
 
-Today, the first steps have been taken to restore this landmark functionality with the initial release of **SR2:REDWANGO** - a replacement DWANGO server. At present, this is a bridge for two copies of the flycast emulator - enabling full simulated online gameplay. There is no reason why this would not support real hardware if correctly bridged, but this requires significant further development.
+Today, this landmark functionality is restored with **SR2:REDWANGO** - a replacement DWANGO server. At present, this is a bridge for copies of the flycast emulator - enabling full simulated online gameplay, up to a full four car grid. There is no reason why this would not support real hardware if correctly bridged, but this requires significant further development.
 
 This version is experimental and designed for those who are comfortable building a branch of an emulator, running python scripts, etc - this is very much not yet plug and play. In time I will write more about the technical side - but the code should tell a lot of the story.
 
 
 ## Status
 
-An extremely barebones, deliberately limited server implementation which allows two copies of a modified flycast build to work through the minimum flow to enter the gameplay state.
-
-Significant portions of the lobby are not implemented, and the initial version has hacks in place which limit functionality - i.e. to a maximum of 4 players ever being connected to the main lobby. This can and will be fixed in time.
+The lobby works. Four players can connect, talk, form a team and race together. Four is the game's own limit, not the server's.
 
 | Part | State |
 | --- | --- |
 | Dial and connect | Works |
 | Lobby, user list, chat rooms | Works |
+| Chat, in both directions | Works |
+| Room list with live player counts | Works |
+| Finding a user | Works |
 | Create a team, join a team | Works |
+| Duplicate player names | Handled - the server renames |
 | Select track, car, launch game | Works |
-| A live two-player race | Works |
+| A live four-player race | Works |
+| Leaving, and returning to the lobby | Works |
+| Player records - races and wins | Works, for the session |
+| Spectator mode | Works |
+| Player ranking | Not implemented - unclear how it works, all server side |
 
 
 
@@ -34,7 +40,7 @@ Significant portions of the lobby are not implemented, and the initial version h
 1. **Python 3.8 or later.** The server uses only the standard library. There are no packages to install.
 2. **A Flycast build with the serial bridge.** Standard Flycast cannot reach this server as Sega Rally 2 operates the modem outside of PPP. A proof of concept implementation is detailed below.
 3. **Your own copy of the game**, and **your own Dreamcast BIOS**. This project supplies neither. **Only the Japanese release of Sega Rally 2 supports online play**. 
-4. **Two instances of the customised emulator.** They can run on one computer.
+4. **Two or more instances of the customised emulator**, up to four. They can run on one computer.
 
 
 
@@ -80,7 +86,7 @@ The game is Japanese and the networking screens have no English mode. An explana
 
 ## How to play
 
-### Step 1. Connect. Do this on BOTH consoles
+### Step 1. Connect. Do this on ALL clients
 
 **1.** Choose the network mode from the main menu. If you get stuck on a green please wait screen, you have not turned the emulate framebuffer mode on.
 
@@ -89,7 +95,7 @@ The game is Japanese and the networking screens have no English mode. An explana
 </div>
 
 
-**2.** Set a player name - **ensure both player names are unique, the server does not handle collisions yet.**
+**2.** Set a player name. If two players pick the same name the server renames the second one, and tells them.
 
 
 **3.** Dial. (press the key mapped for Dreamcast X twice)
@@ -191,7 +197,9 @@ If everything has connected correctly on both clients, you should see the above 
 **8.** The game launches - you are in game.
 
 
-Nothing further is tested. The exit flow may or may not work correctly.
+Exiting a race puts you back in the lobby, where you can form a team and race again. Closing a client, or dropping the line mid-race, is handled - the others carry on and the team gets a new leader if it lost one.
+
+The steps above show two players. Adding a third and a fourth is the same: they dial in, and join the team from the join dialogue.
 
 
 
