@@ -185,6 +185,19 @@ def frame_race(payload, end=RACE_END):
     return bytes(out)
 
 
+# The largest thing a peer can legitimately send between two frame markers.
+# Real messages are 176 bytes and race records are smaller. This cap only
+# exists to stop a peer that never sends a terminator from growing the buffer
+# without limit. On a public server that stream is a trivial memory-exhaustion
+# attack; on any server it is a bug. 64 KiB is far above any real frame.
+MAX_FRAME = 0x10000
+
+
+class DeframeError(Exception):
+    """A peer sent more than MAX_FRAME bytes with no terminator. The owner
+    should drop the connection; the byte stream is not the game's."""
+
+
 class Deframer:
     """The receiving half, written to mirror FUN_10008e80 exactly.
 
@@ -208,6 +221,8 @@ class Deframer:
                     self.escaped = True
                 else:
                     self.buf.append(b)
+                    if len(self.buf) > MAX_FRAME:
+                        raise DeframeError()
                 continue
             self.escaped = False
             if b == FRAME_START:
@@ -227,6 +242,8 @@ class Deframer:
                 self.buf.clear()
             else:
                 self.buf.append(b)
+                if len(self.buf) > MAX_FRAME:
+                    raise DeframeError()
         return out
 
 

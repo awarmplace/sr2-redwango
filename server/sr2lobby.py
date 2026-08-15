@@ -53,6 +53,11 @@ import c203
 
 PORT = int(os.environ.get("SR2_PORT", "7654"))
 
+# The most connections the lobby will hold. A real session is a handful
+# of players; this only stops a peer from opening sockets until the file
+# descriptors run out.
+MAX_CLIENTS = int(os.environ.get("SR2_MAX_CLIENTS", "32"))
+
 LOBBY_NAME = "SEGA RALLY 2"
 # A label for the LOG ONLY, one per connection, counted upward without a limit.
 #
@@ -1365,6 +1370,14 @@ class Lobby:
             for s in readable:
                 if s is srv:
                     conn, addr = srv.accept()
+                    # Refuse past the cap. Without it, one peer opening sockets
+                    # in a loop exhausts the file descriptors and the lobby
+                    # stops answering. The cap is far above any real lobby.
+                    if len(self.clients) >= MAX_CLIENTS:
+                        log(f"refused {addr[0]}:{addr[1]}, "
+                            f"{len(self.clients)} clients is the limit")
+                        conn.close()
+                        continue
                     conn.setblocking(False)     # nothing may block the loop
                     self.next_name += 1
                     name = CONN_LABEL.format(self.next_name)
@@ -1392,7 +1405,18 @@ class Lobby:
                     s.close()
                     continue
 
-                for msg in client.deframer.feed(data):
+                try:
+                    framed = client.deframer.feed(data)
+                except c203.DeframeError:
+                    # The peer sent a flood with no frame terminator. That is
+                    # not the game: drop it rather than grow a buffer for ever.
+                    log(f"{client.name} sent an unterminated flood, dropping it")
+                    self.depart(client, "flooded")
+                    del self.clients[s]
+                    s.close()
+                    continue
+
+                for msg in framed:
                     # One malformed message must not take the server down. A
                     # crash here closes the socket, and the client then waits
                     # for a reply that can never arrive.
